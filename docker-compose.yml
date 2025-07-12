@@ -1,0 +1,24 @@
+version: '3.8'
+networks:
+  macvlan:
+    name: macvlan
+    external: true
+
+
+services:
+  mcwebsite:
+    build: .
+    networks:
+      - macvlan
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./src/config.json:/app/src/config.json
+      - ./wallpapers:/app/wallpapers
+      - player-data:/app/data
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+
+volumes:
+  player-data:

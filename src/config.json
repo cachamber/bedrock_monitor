@@ -1,0 +1,14 @@
+{
+  "eventSource": "direct",
+  "debugLevel": "info",
+  "mqtt": {
+    "broker": "ws://",
+    "topic": "mc-webhook",
+    "clientId": "mclog-viewer",
+    "username": "",
+    "password": ""
+  },
+  "ui": {
+    "background": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+  }
+}
