@@ -1,15 +1,13 @@
 version: '3.8'
-networks:
-  macvlan:
-    name: macvlan
-    external: true
-
 
 services:
-  mcwebsite:
-    build: .
-    networks:
-      - macvlan
+  minecraft-monitor:
+    container_name: minecraft-monitor
+    image: cachamber/minecraft-monitor
+    build: 
+      context: .
+      tags:
+        - "cachamber/minecraft-monitor:latest"
     ports:
       - "3001:3001"
     volumes:
@@ -18,7 +16,8 @@ services:
       - player-data:/app/data
     environment:
       - NODE_ENV=production
+      - UID=${UID:-1000}
+      - GID=${GID:-1000}
     restart: unless-stopped
-
 volumes:
   player-data:

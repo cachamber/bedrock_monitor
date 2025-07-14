@@ -27,6 +27,12 @@ Edit `src/config.json`:
 {
   "eventSource": "mqtt",
   "debugLevel": "info",
+  "pollingInterval": 2000,
+  "maxLogEntries": 1000,
+  "rateLimit": {
+    "windowMs": 60000,
+    "maxRequests": 100
+  },
   "mqtt": {
     "broker": "ws://your-mqtt-broker:9001",
     "topic": "mc-webhook",
@@ -44,10 +50,14 @@ Edit `src/config.json`:
 - `"mqtt"` - Receive events from MQTT broker
 - `"direct"` - Receive events via HTTP POST to `/api/events`
 
-### Debug Levels
-- `"error"` - Only error messages
-- `"info"` - Info and error messages (default)
-- `"debug"` - All messages including player updates
+### Configuration Options
+- `"eventSource"` - Event source: `"mqtt"` or `"direct"`
+- `"debugLevel"` - Logging level: `"error"`, `"info"`, or `"debug"`
+- `"pollingInterval"` - Frontend polling interval in milliseconds (default: 2000)
+- `"maxLogEntries"` - Maximum log entries to keep in memory (default: 1000)
+- `"rateLimit"` - API rate limiting configuration
+  - `"windowMs"` - Time window in milliseconds (default: 60000)
+  - `"maxRequests"` - Max requests per window (default: 100)
 
 ## Event Types
 
@@ -88,13 +98,14 @@ npm start
 
 ## Data Persistence
 
-Player data is automatically saved to the server on every event and restored on page load via `/api/player-data` endpoint.
+Player data is automatically saved to `data/player-data.json` on every event and restored on page load via `/api/player-data` endpoint. The `data/` directory is created automatically on first run.
 
 ## API Endpoints
 
-- `GET /api/player-data` - Load current player data (recomputed on each call)
+- `GET /api/player-data` - Load current player data (cached for performance)
 - `GET /api/config` - Get UI configuration
 - `POST /api/events` - Receive events directly (when eventSource is "direct")
+- `GET /api/health` - Health check endpoint
 
 ### Direct Event Example
 
@@ -152,10 +163,26 @@ services:
       - player-data:/app/data
     environment:
       - NODE_ENV=production
+      - UID=${UID:-1000}
+      - GID=${GID:-1000}
     restart: unless-stopped
 
 volumes:
   player-data:
+```
+
+### User Configuration
+
+Set UID/GID environment variables to match your host user:
+
+```bash
+# Use current user
+export UID=$(id -u)
+export GID=$(id -g)
+docker-compose up -d
+
+# Or specify custom values
+UID=1001 GID=1001 docker-compose up -d
 ```
 
 ### Docker Features
@@ -163,3 +190,4 @@ volumes:
 - Persistent data storage
 - Auto-restart on failure
 - Production optimized build
+- Configurable UID/GID for file permissions

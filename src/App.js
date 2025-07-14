@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import './App.css';
 
 function App() {
@@ -10,39 +10,95 @@ function App() {
   const [backendConnected, setBackendConnected] = useState(false);
   const [mqttError, setMqttError] = useState(null);
   const [eventSource, setEventSource] = useState('mqtt');
+  const [sortField, setSortField] = useState('status');
+  const [sortDirection, setSortDirection] = useState('desc');
+  const [pollingInterval, setPollingInterval] = useState(2000);
+  const [error, setError] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
+
+  const sortPlayers = useCallback((players, field, direction) => {
+    return [...players].sort((a, b) => {
+      let aVal = a[field];
+      let bVal = b[field];
+      
+      if (field === 'lastSeen') {
+        aVal = new Date(aVal);
+        bVal = new Date(bVal);
+      }
+      
+      if (aVal < bVal) return direction === 'asc' ? -1 : 1;
+      if (aVal > bVal) return direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }, []);
+
+  const sortedPlayers = useMemo(() => {
+    return sortPlayers(allPlayers, sortField, sortDirection);
+  }, [allPlayers, sortField, sortDirection, sortPlayers]);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const response = await fetch('/api/player-data');
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      
+      if (data.players) {
+        setAllPlayers(data.players);
+        setCurrentPlayers(data.players.filter(p => p.status === 'online'));
+        setStats({ uniquePlayers: data.players.length });
+      }
+      
+      setMqttConnected(data.mqttConnected || false);
+      setMqttError(data.mqttError);
+      setEventSource(data.eventSource || 'mqtt');
+      setBackendConnected(true);
+      setError(null);
+      setLastUpdate(new Date());
+      
+      if (data.pollingInterval && data.pollingInterval !== pollingInterval) {
+        setPollingInterval(data.pollingInterval);
+      }
+    } catch (e) {
+      console.error('Failed to load data:', e);
+      setBackendConnected(false);
+      setError(e.message);
+    }
+  }, [pollingInterval]);
 
   useEffect(() => {
-    fetch('/api/config')
-      .then(response => response.json())
-      .then(config => {
-        if (config.background) setBackground(config.background);
-      })
-      .catch(e => console.error('Failed to load config:', e));
-
-    const fetchData = () => {
-      fetch('/api/player-data')
-        .then(response => response.json())
-        .then(data => {
-          if (data.players) {
-            setAllPlayers(data.players);
-            setCurrentPlayers(data.players.filter(p => p.status === 'online'));
-            setStats({ uniquePlayers: data.players.length });
-          }
-          setMqttConnected(data.mqttConnected || false);
-          setMqttError(data.mqttError);
-          setEventSource(data.eventSource || 'mqtt');
-          setBackendConnected(true);
-        })
-        .catch(e => {
-          console.error('Failed to load data:', e);
-          setBackendConnected(false);
-        });
+    const loadConfig = async () => {
+      try {
+        const response = await fetch('/api/config');
+        if (response.ok) {
+          const config = await response.json();
+          if (config.background) setBackground(config.background);
+          if (config.pollingInterval) setPollingInterval(config.pollingInterval);
+        }
+      } catch (e) {
+        console.error('Failed to load config:', e);
+      }
     };
 
-    fetchData();
-    const interval = setInterval(fetchData, 2000);
-    return () => clearInterval(interval);
+    loadConfig();
   }, []);
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, pollingInterval);
+    return () => clearInterval(interval);
+  }, [fetchData, pollingInterval]);
+
+  const handleSort = useCallback((field) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDirection(field === 'status' ? 'desc' : 'asc');
+    }
+  }, [sortField, sortDirection]);
 
   return (
     <div className="App" style={{ 
@@ -66,7 +122,17 @@ function App() {
               {mqttConnected ? '🟢 MQTT Connected' : `🔴 MQTT Disconnected${mqttError ? `: ${mqttError}` : ''}`}
             </span>
           )}
+          {lastUpdate && (
+            <span className="status-indicator connected">
+              🕒 Last Update: {lastUpdate.toLocaleTimeString()}
+            </span>
+          )}
         </div>
+        {error && (
+          <div className="error-banner">
+            ⚠️ Error: {error}
+          </div>
+        )}
       </header>
 
       <div className="stats">
@@ -101,18 +167,32 @@ function App() {
         <table>
           <thead>
             <tr>
-              <th>Player</th>
-              <th>Status</th>
-              <th>World</th>
-              <th>Container</th>
-              <th>Played Duration</th>
-              <th>Last Duration</th>
-              <th>Last Seen</th>
+              <th onClick={() => handleSort('name')} style={{cursor: 'pointer'}}>
+                Player {sortField === 'name' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('status')} style={{cursor: 'pointer'}}>
+                Status {sortField === 'status' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('world')} style={{cursor: 'pointer'}}>
+                World {sortField === 'world' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('container')} style={{cursor: 'pointer'}}>
+                Container {sortField === 'container' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('playedDuration')} style={{cursor: 'pointer'}}>
+                Played Duration {sortField === 'playedDuration' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('lastDuration')} style={{cursor: 'pointer'}}>
+                Last Duration {sortField === 'lastDuration' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
+              <th onClick={() => handleSort('lastSeen')} style={{cursor: 'pointer'}}>
+                Last Seen {sortField === 'lastSeen' && (sortDirection === 'asc' ? '↑' : '↓')}
+              </th>
             </tr>
           </thead>
           <tbody>
-            {allPlayers.map((player, index) => (
-              <tr key={index}>
+            {sortedPlayers.map((player, index) => (
+              <tr key={`${player.name}-${index}`}>
                 <td>{player.name}</td>
                 <td>
                   <span className={`status ${player.status}`}>

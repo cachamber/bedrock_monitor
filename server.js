@@ -2,6 +2,8 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const mqtt = require('mqtt');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,43 +13,197 @@ const DATA_FILE = path.join(__dirname, 'data', 'player-data.json');
 if (!fs.existsSync(path.join(__dirname, 'data'))) {
   fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
 }
-const config = require('./src/config.json');
 
+let config;
+try {
+  config = require('./src/config.json');
+} catch (error) {
+  console.error('Failed to load config:', error);
+  process.exit(1);
+}
+
+// State management
 let logData = [];
-let allPlayers = [];
+let cachedPlayers = [];
+let cacheTimestamp = 0;
 let mqttConnected = false;
 let mqttError = null;
 let mqttInitialConnection = true;
+let serverStartTime = new Date();
 
 function log(level, message) {
   const debugLevel = config.debugLevel || 'info';
   const levels = { error: 0, info: 1, debug: 2 };
   if (levels[level] <= levels[debugLevel]) {
-    console.log(`[${level.toUpperCase()}] ${message}`);
+    console.log(`[${level.toUpperCase()}] ${new Date().toISOString()} ${message}`);
   }
 }
 
-app.use(express.json());
+// Rate limiting configuration
+const limiter = rateLimit({
+  windowMs: config.rateLimit?.windowMs || 60000,
+  max: config.rateLimit?.maxRequests || 100,
+  message: { error: 'Too many requests' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+function validateEvent(event) {
+  const validTypes = ['PLAYER_CONNECTED', 'PLAYER_DISCONNECTED', 'SERVER_STARTED', 'SERVER_STOPPED', 'BACKUP_COMPLETE'];
+  
+  if (!event || typeof event !== 'object') {
+    throw new Error('Event must be an object');
+  }
+  
+  if (!validTypes.includes(event.type)) {
+    throw new Error(`Invalid event type: ${event.type}`);
+  }
+  
+  if ((event.type === 'PLAYER_CONNECTED' || event.type === 'PLAYER_DISCONNECTED') && !event.playerName) {
+    throw new Error('Player events must include playerName');
+  }
+  
+  // Sanitize strings
+  if (event.playerName) event.playerName = String(event.playerName).trim().slice(0, 50);
+  if (event.worldName) event.worldName = String(event.worldName).trim().slice(0, 100);
+  if (event.containerName) event.containerName = String(event.containerName).trim().slice(0, 100);
+  
+  return event;
+}
+
+function formatDuration(ms) {
+  const hours = Math.floor(ms / (1000 * 60 * 60));
+  const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+  const seconds = Math.floor((ms % (1000 * 60)) / 1000);
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
+function updatePlayerFromEvent(event) {
+  const playerName = event.playerName;
+  const existing = cachedPlayers.find(p => p.name === playerName);
+  
+  if (event.type === 'PLAYER_CONNECTED') {
+    if (existing) {
+      existing.status = 'online';
+      existing.lastSeen = event.timestamp;
+      existing.sessionStart = new Date(event.timestamp);
+      if (event.worldName) existing.world = event.worldName;
+      if (event.containerName) existing.container = event.containerName?.replace(/^\//, '') || event.containerName;
+    } else {
+      cachedPlayers.push({
+        name: playerName,
+        status: 'online',
+        lastSeen: event.timestamp,
+        xuid: event.playerXuid,
+        world: event.worldName,
+        container: event.containerName?.replace(/^\//, '') || event.containerName,
+        playedDuration: '0h 0m 0s',
+        lastDuration: '0h 0m 0s',
+        currentSessionDuration: '0h 0m 0s',
+        sessionStart: new Date(event.timestamp)
+      });
+    }
+  } else if (event.type === 'PLAYER_DISCONNECTED') {
+    if (existing) {
+      const sessionStart = existing.sessionStart || serverStartTime;
+      const sessionDuration = new Date(event.timestamp) - sessionStart;
+      
+      existing.status = 'disconnected';
+      existing.lastSeen = event.timestamp;
+      existing.lastDuration = formatDuration(sessionDuration);
+      existing.currentSessionDuration = '0h 0m 0s';
+      
+      // Add session duration to total played time
+      const currentTotal = parseDuration(existing.playedDuration || '0h 0m 0s');
+      existing.playedDuration = formatDuration(currentTotal + sessionDuration);
+      
+      delete existing.sessionStart;
+    }
+  }
+}
+
+function parseDuration(durationStr) {
+  const match = durationStr.match(/(\d+)h (\d+)m (\d+)s/);
+  if (!match) return 0;
+  const [, hours, minutes, seconds] = match;
+  return (parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseInt(seconds)) * 1000;
+}
+
+function updateCurrentSessions() {
+  const now = new Date();
+  cachedPlayers.forEach(player => {
+    if (player.status === 'online' && player.sessionStart) {
+      player.currentSessionDuration = formatDuration(now - player.sessionStart);
+    }
+  });
+}
+
+function processEvent(event) {
+  try {
+    const validatedEvent = validateEvent(event);
+    log('info', `Event received: ${validatedEvent.type} - ${validatedEvent.playerName || 'N/A'} - ${validatedEvent.worldName || 'N/A'}`);
+    
+    const timestampedEvent = { ...validatedEvent, timestamp: new Date().toISOString() };
+    
+    if (timestampedEvent.playerName) {
+      updatePlayerFromEvent(timestampedEvent);
+    }
+    
+    cacheTimestamp = Date.now();
+    savePlayerData();
+  } catch (error) {
+    log('error', `Event validation failed: ${error.message}`);
+    throw error;
+  }
+}
+
+function getCachedPlayers() {
+  const now = Date.now();
+  if (now - cacheTimestamp > 5000) {
+    updateCurrentSessions();
+    cacheTimestamp = now;
+    log('debug', `Cache updated: ${cachedPlayers.length} players`);
+  }
+  return cachedPlayers;
+}
+
+function savePlayerData() {
+  try {
+    const players = getCachedPlayers();
+    fs.writeFileSync(DATA_FILE, JSON.stringify({
+      players,
+      timestamp: new Date().toISOString()
+    }, null, 2));
+  } catch (error) {
+    log('error', `Error saving player data: ${error.message}`);
+  }
+}
+
+// Middleware
+app.use(helmet({
+  contentSecurityPolicy: false // Allow inline styles for React
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(limiter);
 app.use('/wallpapers', express.static(path.join(__dirname, 'wallpapers')));
 app.use(express.static(path.join(__dirname, 'build')));
 
-function processEvent(event) {
-  if (event.type) {
-    log('info', `Event received: ${event.type} - ${event.playerName || 'N/A'} - ${event.worldName || 'N/A'}`);
-    logData = [{ ...event, timestamp: new Date().toISOString() }, ...logData.slice(0, 999)];
-    allPlayers = getAllPlayers(logData);
-    const onlinePlayers = allPlayers.filter(p => p.status === 'online');
-    log('debug', `Players updated: ${allPlayers.length} total, ${onlinePlayers.length} online`);
-    savePlayerData();
-  }
-}
+// CORS for production
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', process.env.NODE_ENV === 'production' ? 'same-origin' : '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST');
+  next();
+});
 
-// Event source setup
+// MQTT setup
 if (config.eventSource === 'mqtt') {
   const client = mqtt.connect(config.mqtt.broker, {
     clientId: config.mqtt.clientId,
     username: config.mqtt.username,
-    password: config.mqtt.password
+    password: config.mqtt.password,
+    reconnectPeriod: 5000,
+    connectTimeout: 10000
   });
 
   client.on('connect', () => {
@@ -84,135 +240,88 @@ if (config.eventSource === 'mqtt') {
   mqttConnected = false;
 }
 
-function getAllPlayers(events = []) {
-  const playerStatus = new Map();
-  const playerSessions = new Map();
-  
-  events.slice().reverse().forEach(event => {
-    if (event.playerName) {
-      const existing = playerStatus.get(event.playerName);
-      const sessions = playerSessions.get(event.playerName) || [];
-      
-      if (event.type === 'PLAYER_CONNECTED') {
-        sessions.push({ start: new Date(event.timestamp), end: null });
-        playerSessions.set(event.playerName, sessions);
-        playerStatus.set(event.playerName, {
-          name: event.playerName,
-          status: 'online',
-          lastSeen: event.timestamp,
-          xuid: event.playerXuid,
-          world: event.worldName,
-          container: event.containerName?.replace(/^\//, '') || event.containerName
-        });
-      } else if (event.type === 'PLAYER_DISCONNECTED') {
-        const lastSession = sessions[sessions.length - 1];
-        if (lastSession && !lastSession.end) {
-          lastSession.end = new Date(event.timestamp);
-        }
-        playerSessions.set(event.playerName, sessions);
-        playerStatus.set(event.playerName, {
-          name: event.playerName,
-          status: 'disconnected',
-          lastSeen: event.timestamp,
-          xuid: event.playerXuid,
-          world: existing?.world || event.worldName,
-          container: existing?.container || event.containerName?.replace(/^\//, '') || event.containerName
-        });
-      }
-    }
-  });
-  
-  return Array.from(playerStatus.values()).map(player => {
-    const sessions = playerSessions.get(player.name) || [];
-    const totalMs = sessions.reduce((total, session) => {
-      const end = session.end || new Date();
-      return total + (end - session.start);
-    }, 0);
-    const hours = Math.floor(totalMs / (1000 * 60 * 60));
-    const minutes = Math.floor((totalMs % (1000 * 60 * 60)) / (1000 * 60));
-    const seconds = Math.floor((totalMs % (1000 * 60)) / 1000);
-    
-    const lastSession = sessions[sessions.length - 1];
-    let lastDuration = '0h 0m 0s';
-    if (lastSession) {
-      const lastEnd = lastSession.end || new Date();
-      const lastMs = lastEnd - lastSession.start;
-      const lastHours = Math.floor(lastMs / (1000 * 60 * 60));
-      const lastMinutes = Math.floor((lastMs % (1000 * 60 * 60)) / (1000 * 60));
-      const lastSeconds = Math.floor((lastMs % (1000 * 60)) / 1000);
-      lastDuration = `${lastHours}h ${lastMinutes}m ${lastSeconds}s`;
-    }
-    
-    let currentSessionDuration = '0h 0m 0s';
-    if (player.status === 'online' && lastSession && !lastSession.end) {
-      const currentMs = new Date() - lastSession.start;
-      const currentHours = Math.floor(currentMs / (1000 * 60 * 60));
-      const currentMinutes = Math.floor((currentMs % (1000 * 60 * 60)) / (1000 * 60));
-      const currentSeconds = Math.floor((currentMs % (1000 * 60)) / 1000);
-      currentSessionDuration = `${currentHours}h ${currentMinutes}m ${currentSeconds}s`;
-    }
-    
-    return {
-      ...player,
-      playedDuration: `${hours}h ${minutes}m ${seconds}s`,
-      lastDuration,
-      currentSessionDuration
-    };
-  });
-}
-
-function savePlayerData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({
-      players: allPlayers,
-      timestamp: new Date().toISOString()
-    }, null, 2));
-  } catch (error) {
-    console.error('Error saving player data:', error);
-  }
-}
-
 // Load existing data on startup
 if (fs.existsSync(DATA_FILE)) {
   try {
     const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    allPlayers = data.players || [];
+    if (data.players) {
+      cachedPlayers = data.players.map(player => ({
+        ...player,
+        status: 'disconnected',
+        currentSessionDuration: '0h 0m 0s',
+        sessionStart: player.status === 'online' ? serverStartTime : undefined
+      }));
+      cacheTimestamp = Date.now();
+      log('info', `Loaded ${data.players.length} players from saved data (all set to disconnected)`);
+    }
   } catch (e) {
-    console.error('Failed to load existing data:', e);
+    log('error', `Failed to load existing data: ${e.message}`);
   }
+} else {
+  log('info', 'No existing player data found, starting fresh');
 }
 
-// Get current player data
+// API Routes
 app.get('/api/player-data', (req, res) => {
-  const updatedPlayers = getAllPlayers(logData);
-  allPlayers = updatedPlayers;
-  res.json({
-    players: updatedPlayers,
-    timestamp: new Date().toISOString(),
-    mqttConnected,
-    mqttError,
-    eventSource: config.eventSource
-  });
+  try {
+    const players = getCachedPlayers();
+    res.json({
+      players,
+      timestamp: new Date().toISOString(),
+      mqttConnected,
+      mqttError,
+      eventSource: config.eventSource,
+      pollingInterval: config.pollingInterval || 2000
+    });
+  } catch (error) {
+    log('error', `Error getting player data: ${error.message}`);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Get UI configuration
 app.get('/api/config', (req, res) => {
-  res.json(config.ui || {});
+  try {
+    res.json({
+      ...config.ui,
+      pollingInterval: config.pollingInterval || 2000
+    });
+  } catch (error) {
+    log('error', `Error getting config: ${error.message}`);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Receive events directly via JSON
 app.post('/api/events', (req, res) => {
   try {
     processEvent(req.body);
     res.json({ success: true });
   } catch (error) {
     log('error', `Error processing event: ${error.message}`);
-    res.status(500).json({ error: 'Failed to process event' });
+    res.status(400).json({ error: error.message });
   }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
 });
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'build', 'index.html'));
+});
+
+
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  log('info', 'Received SIGTERM, shutting down gracefully');
+  savePlayerData();
+  process.exit(0);
 });
 
 app.listen(PORT, () => {
